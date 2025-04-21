@@ -10,6 +10,7 @@ class Sin(nn.Module):
     def forward(self, input):
         return torch.sin(input)
 
+
 def train(num_epoch, batch_size, train_loader, num_slices_train, inputs_val, targets_val,
           model, optimizer, scheduler, criterion):
     num_period = int(num_slices_train / batch_size)
@@ -40,10 +41,9 @@ def train(num_epoch, batch_size, train_loader, num_slices_train, inputs_val, tar
                 loss = criterion(
                     targets_P=targets_train_batch,
                     outputs_P=p_pred,
-                    t = inputs_train_batch[:,0],
-                    rho=851.6,
-                    V=2*np.exp(-4),
-                    inputs_Q=inputs_train_batch[:,3],
+                    t=inputs_train_batch[:, 0],
+                    mdot_A=inputs_train_batch[:, 1],
+                    V=2 * np.exp(-4),
                     bulk_modulus_model='cons',
                     air_dissolution_model='off',
                     rho_L_atm=851.6,
@@ -68,25 +68,24 @@ def train(num_epoch, batch_size, train_loader, num_slices_train, inputs_val, tar
         results_epoch['loss_train'][epoch] = torch.mean(results_period['loss_train'])
         model.eval()
         P_pred_val = model(inputs=inputs_val)
-        loss_val=criterion(
-                    targets_P=targets_val,
-                    outputs_P=P_pred_val,
-                    t = inputs_val[:,0],
-                    rho=851.6,
-                    V=2*np.exp(-4),
-                    inputs_Q=inputs_val[:,3],
-                    bulk_modulus_model='constf',
-                    air_dissolution_model='off',
-                    rho_L_atm=851.6,
-                    beta_L_atm=1.46696e+03,
-                    beta_gain=0.2,
-                    air_fraction=0.005,
-                    rho_g_atm=1.225,
-                    polytropic_index=1.0,
-                    p_atm=0.101325,
-                    p_crit=3,
-                    p_min=1
-                )
+        loss_val = criterion(
+            targets_P=targets_val,
+            outputs_P=P_pred_val,
+            t=inputs_val[:, 0],
+            mdot_A=inputs_val[:,1],
+            V=2 * np.exp(-4),
+            bulk_modulus_model='constf',
+            air_dissolution_model='off',
+            rho_L_atm=851.6,
+            beta_L_atm=1.46696e+03,
+            beta_gain=0.2,
+            air_fraction=0.005,
+            rho_g_atm=1.225,
+            polytropic_index=1.0,
+            p_atm=0.101325,
+            p_crit=3,
+            p_min=1
+        )
         scheduler.step()
         results_epoch['loss_val'][epoch] = criterion.loss_M.detach()
 
@@ -162,7 +161,7 @@ class My_loss(nn.Module):
     def __init__(self):
         super().__init__()
 
-    def mixture_density_derivative(self,p, bulk_modulus_model, air_dissolution_model,
+    def mixture_density_derivative(self, p, bulk_modulus_model, air_dissolution_model,
                                    rho_L_atm, beta_L_atm, beta_gain, air_fraction,
                                    rho_g_atm, polytropic_index, p_atm, p_crit, p_min):
         # Determine p_used
@@ -225,10 +224,10 @@ class My_loss(nn.Module):
                 base = 1 + beta_gain * (p_used - p_atm) / beta_L_atm
                 exponent = (-1 - 1 / beta_gain)
                 exp_term = (base ** exponent) / beta_L_atm
-        
+
         # Compute initial mixture density
         rho_mix_init = rho_L_atm + rho_g_atm * (air_fraction / (1 - air_fraction))
-    
+
         # Final computation of drho_mix_dp
         if air_fraction == 0:
             drho_mix_dp = rho_L_atm * exp_term
@@ -243,22 +242,28 @@ class My_loss(nn.Module):
 
         return drho_mix_dp
 
-    def forward(self, targets_P, t, rho, V, inputs_Q, outputs_P, bulk_modulus_model, air_dissolution_model,
+    def forward(self, targets_P, t, mdot_A, V, outputs_P, bulk_modulus_model, air_dissolution_model,
                 rho_L_atm, beta_L_atm, beta_gain, air_fraction,
                 rho_g_atm, polytropic_index, p_atm, p_crit, p_min):
         num = targets_P.shape[0]
         theta = 0.2
-        loss=0
-        for i in range(1,num):
-            dpdt = (outputs_P[i] - outputs_P[i-1]) / (t[i] - t[0])
-            loss_physics = V * self.mixture_density_derivative(outputs_P[i]*0.1, bulk_modulus_model, air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain, air_fraction,rho_g_atm, polytropic_index, p_atm, p_crit,p_min) * dpdt - inputs_Q[i]* rho/60000
-           # print(f"dpdt:{dpdt.item()},density_der:{self.mixture_density_derivative(outputs_P[i], bulk_modulus_model, air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain, air_fraction,rho_g_atm, polytropic_index, p_atm, p_crit,p_min).item()};Q:{inputs_Q[i].item()}")
-            print(f"V*der*dpdt:{(V * self.mixture_density_derivative(outputs_P[i]*0.1, bulk_modulus_model, air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain, air_fraction,rho_g_atm, polytropic_index, p_atm, p_crit,p_min) * dpdt).item()},inputs_Q[i]* rho:{(inputs_Q[i]* rho/60000).item()}")
+        loss = 0
+        for i in range(1, num):
+            if(t[i]<=t[i-1]):
+                continue
+
+            dpdt = (outputs_P[i] - outputs_P[i - 1]) / (t[i] - t[i-1])
+            loss_physics = V * self.mixture_density_derivative(outputs_P[i] , bulk_modulus_model,
+                                                               air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain,
+                                                               air_fraction, rho_g_atm, polytropic_index, p_atm, p_crit,
+                                                               p_min) * dpdt -mdot_A[i]
+            # print(f"dpdt:{dpdt.item()},density_der:{self.mixture_density_derivative(outputs_P[i], bulk_modulus_model, air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain, air_fraction,rho_g_atm, polytropic_index, p_atm, p_crit,p_min).item()};Q:{inputs_Q[i].item()}")
+            # print(f"der:{( self.mixture_density_derivative(outputs_P[i] , bulk_modulus_model, air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain, air_fraction, rho_g_atm, polytropic_index, p_atm, p_crit, p_min)).item()},mdot_A{mdot_A[i].item()},V:{V},dp/dt={dpdt.item()}")
             loss_physics = abs(loss_physics)
-            loss_M = abs(outputs_P[i] -targets_P[i] )
+            loss_M = abs(outputs_P[i] - targets_P[i])
             loss += loss_M + theta * loss_physics
-        self.loss_M=loss_M
-        self.loss_physics=loss_physics
+        self.loss_M = loss_M
+        self.loss_physics = loss_physics
         return loss
 
 
@@ -295,8 +300,9 @@ def standardize_tensor(data, mode, mean=0, std=1):
 
 # TODO 确定密度与压力的梯度函数，以及函数里面的参数
 seq_len = 1
-data = pd.read_csv('PumpData2.csv')
-X = data.drop(['pOut', 'fault'], axis=1)
+data = pd.read_csv('combined_all.csv')
+print(data)
+X = data.drop(['pOut'], axis=1)
 Y = data['pOut']
 # 按照时间顺序划分训练集、验证集和测试集
 # 假设训练集占60%，验证集占20%，测试集占20%
@@ -331,7 +337,7 @@ print(X_train_tensor.shape)
 class MyNeuralNet(nn.Module):
     def __init__(self):
         super().__init__()
-        self.input_to_hidden_layer = nn.Linear(5, 8)
+        self.input_to_hidden_layer = nn.Linear(4, 8)
         self.hidden_layer_activation = nn.ReLU()
         self.hidden_to_output_layer = nn.Linear(8, 1)
 
@@ -383,12 +389,14 @@ for round in range(num_rounds):
     targets_val = targets_dict['val'].to(device)
     targets_test = targets_dict['test'].to(device)
 
-    inputs_dim = 5
+    inputs_dim = 4
     outputs_dim = 1
-    _, mean_inputs_train, std_inputs_train = standardize_tensor(torch.reshape(inputs_train, (594, 1, 5)), mode='fit')
+    num = inputs_train.shape[0]
+    _, mean_inputs_train, std_inputs_train = standardize_tensor(torch.reshape(inputs_train, (num, 1, 4)), mode='fit')
     _, mean_targets_train, std_targets_train = standardize_tensor(targets_train, mode='fit')
-
-    test = torch.reshape(inputs_train, (594, 1, 5))
+    print(f"inputs_train.shape:{inputs_train.shape}")
+    num=inputs_train.shape[0]
+    test = torch.reshape(inputs_train, (num, 1, 4))
     train_set = TensorDataset(inputs_train, targets_train)
     train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=False, num_workers=0, drop_last=True)
 
