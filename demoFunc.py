@@ -5,8 +5,10 @@ import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from torch import optim
 
-from functions import Sin
 
+class Sin(nn.Module):
+    def forward(self, input):
+        return torch.sin(input)
 
 def train(num_epoch, batch_size, train_loader, num_slices_train, inputs_val, targets_val,
           model, optimizer, scheduler, criterion):
@@ -40,18 +42,18 @@ def train(num_epoch, batch_size, train_loader, num_slices_train, inputs_val, tar
                     outputs_P=p_pred,
                     t = inputs_train_batch[:,0],
                     rho=851.6,
-                    V=0.001,
+                    V=2*np.exp(-4),
                     inputs_Q=inputs_train_batch[:,3],
                     bulk_modulus_model='cons',
-                    air_dissolution_model='of',
+                    air_dissolution_model='off',
                     rho_L_atm=851.6,
-                    beta_L_atm=1.46696e+09,
+                    beta_L_atm=1.46696e+03,
                     beta_gain=0.2,
                     air_fraction=0.005,
                     rho_g_atm=1.225,
                     polytropic_index=1.0,
-                    p_atm=101325,
-                    p_crit=50000,
+                    p_atm=0.101325,
+                    p_crit=3,
                     p_min=1
 
                 )
@@ -71,18 +73,18 @@ def train(num_epoch, batch_size, train_loader, num_slices_train, inputs_val, tar
                     outputs_P=P_pred_val,
                     t = inputs_val[:,0],
                     rho=851.6,
-                    V=0.001,
+                    V=2*np.exp(-4),
                     inputs_Q=inputs_val[:,3],
-                    bulk_modulus_model='const',
+                    bulk_modulus_model='constf',
                     air_dissolution_model='off',
                     rho_L_atm=851.6,
-                    beta_L_atm=1.46696e+09,
+                    beta_L_atm=1.46696e+03,
                     beta_gain=0.2,
                     air_fraction=0.005,
                     rho_g_atm=1.225,
                     polytropic_index=1.0,
-                    p_atm=101325,
-                    p_crit=50000,
+                    p_atm=0.101325,
+                    p_crit=3,
                     p_min=1
                 )
         scheduler.step()
@@ -223,10 +225,10 @@ class My_loss(nn.Module):
                 base = 1 + beta_gain * (p_used - p_atm) / beta_L_atm
                 exponent = (-1 - 1 / beta_gain)
                 exp_term = (base ** exponent) / beta_L_atm
-
+        
         # Compute initial mixture density
         rho_mix_init = rho_L_atm + rho_g_atm * (air_fraction / (1 - air_fraction))
-
+    
         # Final computation of drho_mix_dp
         if air_fraction == 0:
             drho_mix_dp = rho_L_atm * exp_term
@@ -245,11 +247,13 @@ class My_loss(nn.Module):
                 rho_L_atm, beta_L_atm, beta_gain, air_fraction,
                 rho_g_atm, polytropic_index, p_atm, p_crit, p_min):
         num = targets_P.shape[0]
-        theta = 0.001
+        theta = 0.2
         loss=0
         for i in range(1,num):
             dpdt = (outputs_P[i] - outputs_P[i-1]) / (t[i] - t[0])
-            loss_physics = V * self.mixture_density_derivative(outputs_P[i], bulk_modulus_model, air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain, air_fraction,rho_g_atm, polytropic_index, p_atm, p_crit,p_min) * dpdt - inputs_Q[i]* rho
+            loss_physics = V * self.mixture_density_derivative(outputs_P[i]*0.1, bulk_modulus_model, air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain, air_fraction,rho_g_atm, polytropic_index, p_atm, p_crit,p_min) * dpdt - inputs_Q[i]* rho/60000
+           # print(f"dpdt:{dpdt.item()},density_der:{self.mixture_density_derivative(outputs_P[i], bulk_modulus_model, air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain, air_fraction,rho_g_atm, polytropic_index, p_atm, p_crit,p_min).item()};Q:{inputs_Q[i].item()}")
+            print(f"V*der*dpdt:{(V * self.mixture_density_derivative(outputs_P[i]*0.1, bulk_modulus_model, air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain, air_fraction,rho_g_atm, polytropic_index, p_atm, p_crit,p_min) * dpdt).item()},inputs_Q[i]* rho:{(inputs_Q[i]* rho/60000).item()}")
             loss_physics = abs(loss_physics)
             loss_M = abs(outputs_P[i] -targets_P[i] )
             loss += loss_M + theta * loss_physics
@@ -291,7 +295,7 @@ def standardize_tensor(data, mode, mean=0, std=1):
 
 # TODO 确定密度与压力的梯度函数，以及函数里面的参数
 seq_len = 1
-data = pd.read_csv('PumpData5.csv')
+data = pd.read_csv('PumpData2.csv')
 X = data.drop(['pOut', 'fault'], axis=1)
 Y = data['pOut']
 # 按照时间顺序划分训练集、验证集和测试集
@@ -443,5 +447,3 @@ results['P_pred'] = P_pred_test.detach().cpu().numpy().squeeze()
 results['Cycles'] = inputs_test[:, 0].detach().cpu().numpy().squeeze()
 results['Epochs'] = np.arange(0, num_epoch)
 torch.save(results, 'testTriplex.pth')
-
-
