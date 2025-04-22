@@ -4,13 +4,14 @@ from torch import nn
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from torch import optim
-
-
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+torch.set_default_dtype(torch.float64)
 class Sin(nn.Module):
     def forward(self, input):
         return torch.sin(input)
-
-
+torch.cuda.empty_cache()
+torch.set_printoptions(precision=10)
 def train(num_epoch, batch_size, train_loader, num_slices_train, inputs_val, targets_val,
           model, optimizer, scheduler, criterion):
     num_period = int(num_slices_train / batch_size)
@@ -22,26 +23,22 @@ def train(num_epoch, batch_size, train_loader, num_slices_train, inputs_val, tar
         results_epoch = dict()
         results_epoch['loss_train'] = torch.zeros(num_epoch)
         results_epoch['loss_val'] = torch.zeros(num_epoch)
+        
         with torch.backends.cudnn.flags(enabled=False):
             for period, (inputs_train_batch, targets_train_batch) in enumerate(train_loader):
                 # print(period, inputs_train_batch, targets_train_batch)
-                p_pred = model(inputs=inputs_train_batch)
+                p_pred,P_t_pred = model(inputs=inputs_train_batch)
                 results_period = dict()
                 results_period['loss_train'] = torch.zeros(num_period)
                 results_period['var_P'] = torch.zeros(num_period)
                 results_period['loss_physics'] = torch.zeros(num_period)
-
-                # print(p_pred)
-                # print(inputs_train_batch)
-                # print(inputs_train_batch.shape)
-                # print("targets_P:", targets_train_batch)
-                # print("p_pred:", p_pred)
-                # print("t:",inputs_train_batch[:,0])
-                # print("inputs_Q",inputs_train_batch[:,3])
+                
+               
+                
                 loss = criterion(
                     targets_P=targets_train_batch,
                     outputs_P=p_pred,
-                    t=inputs_train_batch[:, 0],
+                    dpdt=P_t_pred,
                     mdot_A=inputs_train_batch[:, 1],
                     V=2 * np.exp(-4),
                     bulk_modulus_model='cons',
@@ -67,11 +64,11 @@ def train(num_epoch, batch_size, train_loader, num_slices_train, inputs_val, tar
                             epoch + 1, period + 1, loss.item(), criterion.loss_M.item(), criterion.loss_physics.item()))
         results_epoch['loss_train'][epoch] = torch.mean(results_period['loss_train'])
         model.eval()
-        P_pred_val = model(inputs=inputs_val)
+        P_pred_val,P_t_pred_val = model(inputs=inputs_val)
         loss_val = criterion(
             targets_P=targets_val,
             outputs_P=P_pred_val,
-            t=inputs_val[:, 0],
+            dpdt=P_t_pred_val,
             mdot_A=inputs_val[:,1],
             V=2 * np.exp(-4),
             bulk_modulus_model='constf',
@@ -88,7 +85,6 @@ def train(num_epoch, batch_size, train_loader, num_slices_train, inputs_val, tar
         )
         scheduler.step()
         results_epoch['loss_val'][epoch] = criterion.loss_M.detach()
-
         return model, results_epoch
 
 
@@ -118,49 +114,60 @@ def inverse_standardize_tensor(data_norm, mean, std):
 class Neural_Net(nn.Module):
     def __init__(self, seq_len, inputs_dim, outputs_dim, layers, activation='Tanh'):
         super(Neural_Net, self).__init__()
-
-        self.seq_len, self.inputs_dim, self.outputs_dim = seq_len, inputs_dim, outputs_dim
-
-        self.layers = []
-
-        self.layers.append(nn.Linear(in_features=inputs_dim, out_features=layers[0]))
-        nn.init.xavier_normal_(self.layers[-1].weight)
-
+        self.seq_len = seq_len
+        self.inputs_dim = inputs_dim
+        self.outputs_dim = outputs_dim
+        
+        # 强制所有层使用 float64 类型
+        self.layers = nn.ModuleList()  # 使用 ModuleList 替代普通 list 以正确注册子模块
+        
+        # 第一层
+        layer = nn.Linear(inputs_dim, layers[0]).double()  # 创建后立即转为 double
+        nn.init.xavier_normal_(layer.weight)
+        self.layers.append(layer)
+        
+        # 激活函数和 Dropout（无参数，无需修改类型）
         if activation == 'Tanh':
             self.layers.append(nn.Tanh())
         elif activation == 'Sin':
             self.layers.append(Sin())
         self.layers.append(nn.Dropout(p=0.2))
-
+        
+        # 中间层
         for l in range(len(layers) - 1):
-            self.layers.append(nn.Linear(in_features=layers[l], out_features=layers[l + 1]))
-            nn.init.xavier_normal_(self.layers[-1].weight)
-
+            layer = nn.Linear(layers[l], layers[l+1]).double()  # 转为 double
+            nn.init.xavier_normal_(layer.weight)
+            self.layers.append(layer)
+            
             if activation == 'Tanh':
                 self.layers.append(nn.Tanh())
             elif activation == 'Sin':
                 self.layers.append(Sin())
             self.layers.append(nn.Dropout(p=0.2))
-
-        self.layers.append(nn.Linear(in_features=layers[l + 1], out_features=outputs_dim))
-        nn.init.xavier_normal_(self.layers[-1].weight)
-
+        
+        # 输出层
+        layer = nn.Linear(layers[-1], outputs_dim).double()  # 转为 double
+        nn.init.xavier_normal_(layer.weight)
+        self.layers.append(layer)
+        
+        # 构建 Sequential
         self.NN = nn.Sequential(*self.layers)
-
+    
     def forward(self, x):
-        self.x = x
-        self.x.requires_grad_(True)
-        self.x_2D = self.x.contiguous().view((-1, self.inputs_dim))
-        NN_out_2D = self.NN(self.x_2D)
-        self.p_pred = NN_out_2D.contiguous().view((-1, self.seq_len, self.outputs_dim))
-
+        # 确保输入转为 double
+        x = x.double() if x.dtype != torch.float64 else x
+        
+        self.x = x.contiguous().view(-1, self.inputs_dim)
+        NN_out_2D = self.NN(self.x)  # 输入已确保为 double
+        self.p_pred = NN_out_2D.view(-1, self.seq_len, self.outputs_dim)
+        
         return self.p_pred
-
 
 class My_loss(nn.Module):
     def __init__(self):
         super().__init__()
-
+        self.loss_M=torch.tensor(0.0, requires_grad=True)
+        self.loss_physics=torch.tensor(0.0, requires_grad=True)
     def mixture_density_derivative(self, p, bulk_modulus_model, air_dissolution_model,
                                    rho_L_atm, beta_L_atm, beta_gain, air_fraction,
                                    rho_g_atm, polytropic_index, p_atm, p_crit, p_min):
@@ -242,30 +249,32 @@ class My_loss(nn.Module):
 
         return drho_mix_dp
 
-    def forward(self, targets_P, t, mdot_A, V, outputs_P, bulk_modulus_model, air_dissolution_model,
+    def forward(self, targets_P, dpdt, mdot_A, V, outputs_P, bulk_modulus_model, air_dissolution_model,
                 rho_L_atm, beta_L_atm, beta_gain, air_fraction,
                 rho_g_atm, polytropic_index, p_atm, p_crit, p_min):
+        
         num = targets_P.shape[0]
-        theta = 0.2
-        loss = 0
-        for i in range(1, num):
-            if(t[i]<=t[i-1]):
+        theta = 0.6
+        loss = torch.tensor(0.0, requires_grad=True)
+        loss_M=torch.tensor(0.0, requires_grad=True)
+        loss_physics=torch.tensor(0.0, requires_grad=True)
+        for i in range(num):
+            if abs(dpdt[i][0]) < 1e-12:
+               
                 continue
 
-            dpdt = (outputs_P[i] - outputs_P[i - 1]) / (t[i] - t[i-1])
-            loss_physics = V * self.mixture_density_derivative(outputs_P[i] , bulk_modulus_model,
+            loss_physics = V * self.mixture_density_derivative(outputs_P[i]*0.1 , bulk_modulus_model,
                                                                air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain,
                                                                air_fraction, rho_g_atm, polytropic_index, p_atm, p_crit,
-                                                               p_min) * dpdt -mdot_A[i]
+                                                               p_min) * dpdt[i][0] -mdot_A[i]
             # print(f"dpdt:{dpdt.item()},density_der:{self.mixture_density_derivative(outputs_P[i], bulk_modulus_model, air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain, air_fraction,rho_g_atm, polytropic_index, p_atm, p_crit,p_min).item()};Q:{inputs_Q[i].item()}")
-            # print(f"der:{( self.mixture_density_derivative(outputs_P[i] , bulk_modulus_model, air_dissolution_model, rho_L_atm, beta_L_atm, beta_gain, air_fraction, rho_g_atm, polytropic_index, p_atm, p_crit, p_min)).item()},mdot_A{mdot_A[i].item()},V:{V},dp/dt={dpdt.item()}")
+     
             loss_physics = abs(loss_physics)
             loss_M = abs(outputs_P[i] - targets_P[i])
-            loss += loss_M + theta * loss_physics
+            loss =loss + loss_M + theta * loss_physics
         self.loss_M = loss_M
         self.loss_physics = loss_physics
         return loss
-
 
 class TriplexPINN(nn.Module):
     def __init__(self, seq_len, inputs_dim, outputs_dim, layers, scaler_inputs, scaler_targets):
@@ -281,11 +290,33 @@ class TriplexPINN(nn.Module):
         )
 
     def forward(self, inputs):
-        input_norm, _, _ = standardize_tensor(inputs, mode='transform', mean=self.scaler_inputs[0],
-                                              std=self.scaler_inputs[1])
-        P_norm = self.surrogateNN(x=input_norm)
+    
+        #inputs = inputs.unsqueeze(1)
+      
+        s = inputs[:,1: ]
+        t = inputs[:,0:1]
+        #print(f"s.shape:{s.shape}")
+        #print(f"t.shape:{t.shape}")
+        s_norm, _, _ = standardize_tensor(s, mode='transform', mean=self.scaler_inputs[0][1: ],
+                                          std=self.scaler_inputs[1][1: ])
+        t.requires_grad_(True)
+        t_norm, _, _ = standardize_tensor(t, mode='transform', mean=self.scaler_inputs[0][0:1],
+                                          std=self.scaler_inputs[1][0:1])
+        t_norm.requires_grad_(True)
+       
+        P_norm = self.surrogateNN(x=torch.cat((s_norm, t_norm), dim=2))
         P = inverse_standardize_tensor(P_norm, mean=self.scaler_targets[0], std=self.scaler_targets[1])
-        return P
+        grad_outputs = torch.ones_like(P)
+     
+        P_t = torch.autograd.grad(
+            P, t,
+            grad_outputs=grad_outputs,
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True
+        )[0]
+        
+        return P,P_t
 
 
 def standardize_tensor(data, mode, mean=0, std=1):
@@ -301,7 +332,7 @@ def standardize_tensor(data, mode, mean=0, std=1):
 # TODO 确定密度与压力的梯度函数，以及函数里面的参数
 seq_len = 1
 data = pd.read_csv('combined_all.csv')
-print(data)
+
 X = data.drop(['pOut'], axis=1)
 Y = data['pOut']
 # 按照时间顺序划分训练集、验证集和测试集
@@ -322,13 +353,13 @@ X_test = X.iloc[train_size + val_size:]
 y_test = Y.iloc[train_size + val_size:]
 
 # 将数据转换为torch.Tensor格式
-X_train_tensor = torch.tensor(X_train.values, dtype=torch.float32)
-y_train_tensor = torch.tensor(y_train.values, dtype=torch.float32).unsqueeze(1)
-X_val_tensor = torch.tensor(X_val.values, dtype=torch.float32)
-y_val_tensor = torch.tensor(y_val.values, dtype=torch.float32).unsqueeze(1)
-X_test_tensor = torch.tensor(X_test.values, dtype=torch.float32)
-y_test_tensor = torch.tensor(y_test.values, dtype=torch.float32).unsqueeze(1)
-print(X_train_tensor.shape)
+X_train_tensor = torch.tensor(X_train.values, dtype=torch.float64)
+y_train_tensor = torch.tensor(y_train.values, dtype=torch.float64).unsqueeze(1)
+X_val_tensor = torch.tensor(X_val.values, dtype=torch.float64)
+y_val_tensor = torch.tensor(y_val.values, dtype=torch.float64).unsqueeze(1)
+X_test_tensor = torch.tensor(X_test.values, dtype=torch.float64)
+y_test_tensor = torch.tensor(y_test.values, dtype=torch.float64).unsqueeze(1)
+
 
 
 # print(y_test_tensor)
@@ -350,7 +381,7 @@ class MyNeuralNet(nn.Module):
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 settings = {}
-batch_size = 8
+batch_size = 16
 num_epoch = 2000
 num_layers = 5
 num_neurons = 64
@@ -388,13 +419,13 @@ for round in range(num_rounds):
     targets_train = targets_dict['train'].to(device)
     targets_val = targets_dict['val'].to(device)
     targets_test = targets_dict['test'].to(device)
-
+    
     inputs_dim = 4
     outputs_dim = 1
     num = inputs_train.shape[0]
     _, mean_inputs_train, std_inputs_train = standardize_tensor(torch.reshape(inputs_train, (num, 1, 4)), mode='fit')
     _, mean_targets_train, std_targets_train = standardize_tensor(targets_train, mode='fit')
-    print(f"inputs_train.shape:{inputs_train.shape}")
+
     num=inputs_train.shape[0]
     test = torch.reshape(inputs_train, (num, 1, 4))
     train_set = TensorDataset(inputs_train, targets_train)
@@ -410,7 +441,7 @@ for round in range(num_rounds):
     ).to(device)
     criterion = My_loss()
     params = ([p for p in model.parameters()])
-    optimizer = optim.Adam(params, lr=0.001)
+    optimizer = optim.Adam(params, lr=0.0001)
     scheduler = optim.lr_scheduler.StepLR(optimizer, 100, gamma=0.1)
     model, results_epoch = train(
         num_epoch=num_epoch,
@@ -426,15 +457,24 @@ for round in range(num_rounds):
 
     )
     model.eval()
-    P_pred_train = model(inputs=inputs_train)
-    RMSPE_train = torch.sqrt(torch.mean((P_pred_train - targets_train) ** 2, dim=1))
-
-    P_pred_val = model(inputs=inputs_val)
+    P_pred_train,P_t_pred_train = model(inputs=inputs_train)
+    #RMSPE_train = torch.sqrt(torch.mean((P_pred_train - targets_train) ** 2, dim=1))
+    chunk_size = 1024
+    RMSPE_train_chunks = []
+    for i in range(0, P_pred_train.size(0), chunk_size):
+        chunk_pred = P_pred_train[i:i+chunk_size]
+        chunk_target = targets_train[i:i+chunk_size]
+        rmspe_chunk = torch.sqrt(torch.mean((chunk_pred - chunk_target) ** 2, dim=1))
+        RMSPE_train_chunks.append(rmspe_chunk)
+  
+    RMSPE_train = torch.cat(RMSPE_train_chunks, dim=0)
+    print(f"RMSPE_train:{RMSPE_train}")
+    P_pred_val,P_t_pred_val = model(inputs=inputs_val)
     RMSPE_val = torch.sqrt(torch.mean((P_pred_val - targets_val) ** 2, dim=1))
-
-    P_pred_test = model(inputs=inputs_test)
+    print(f"RMSPE_val:{RMSPE_val}")
+    P_pred_test,P_t_pred_test = model(inputs=inputs_test)
     RMSPE_test = torch.sqrt(torch.mean((P_pred_test - targets_test) ** 2, dim=1))
-
+    print(f"RMSPE_test:{RMSPE_test}")
     # metric_rounds['train'][round] = RMSPE_train.detach().cpu().numpy()
     # metric_rounds['val'][round] = RMSPE_val.detach().cpu().numpy()
     # metric_rounds['test'][round] = RMSPE_test.detach().cpu().numpy()
@@ -447,7 +487,7 @@ for round in range(num_rounds):
 model.eval()
 inputs_test = inputs_dict['test'].to(device)
 targets_test = targets_dict['test'].to(device)
-P_pred_test = model(inputs=inputs_test)
+P_pred_test,P_t_pred_test = model(inputs=inputs_test)
 
 results = dict()
 results['P_true'] = targets_test.detach().cpu().numpy().squeeze()
