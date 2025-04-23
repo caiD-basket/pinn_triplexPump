@@ -254,7 +254,7 @@ class My_loss(nn.Module):
                 rho_g_atm, polytropic_index, p_atm, p_crit, p_min):
         
         num = targets_P.shape[0]
-        theta = 0.6
+        theta = 1
         loss = torch.tensor(0.0, requires_grad=True)
         loss_M=torch.tensor(0.0, requires_grad=True)
         loss_physics=torch.tensor(0.0, requires_grad=True)
