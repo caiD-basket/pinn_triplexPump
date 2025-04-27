@@ -467,23 +467,150 @@ for round in range(num_rounds):
         rmspe_chunk = torch.sqrt(torch.mean((chunk_pred - chunk_target) ** 2, dim=1))
         RMSPE_train_chunks.append(rmspe_chunk)
 
-    RMSPE_train = torch.cat(RMSPE_train_chunks, dim=0)
-    print(f"RMSPE_train:{RMSPE_train}")
+     
+    # Calculate metrics for training set
+    def calculate_metrics_in_batches(predictions, targets, batch_size=1024):
+        """分批计算评估指标以节省内存"""
+        total_samples = predictions.size(0)
+        rmse_sum = 0.0
+        mae_sum = 0.0
+        mape_sum = 0.0
+        count = 0
+
+        # 分批计算
+        for i in range(0, total_samples, batch_size):
+            end_idx = min(i + batch_size, total_samples)
+            pred_batch = predictions[i:end_idx]
+            target_batch = targets[i:end_idx]
+
+            # 计算批次的评估指标
+            batch_rmse = torch.sqrt(torch.mean((pred_batch - target_batch) ** 2))
+            batch_mae = torch.mean(torch.abs(pred_batch - target_batch))
+
+            # 避免除以零
+            non_zero_indices = target_batch != 0
+            if torch.any(non_zero_indices):
+                batch_mape = torch.mean(torch.abs((pred_batch[non_zero_indices] - target_batch[non_zero_indices]) /
+                                                  target_batch[non_zero_indices])) * 100
+            else:
+                batch_mape = torch.tensor(0.0, device=pred_batch.device)
+
+            # 累加
+            batch_size_actual = end_idx - i
+            rmse_sum += batch_rmse * batch_size_actual
+            mae_sum += batch_mae * batch_size_actual
+            mape_sum += batch_mape * batch_size_actual
+            count += batch_size_actual
+
+        # 计算平均值
+        rmse = rmse_sum / count
+        mae = mae_sum / count
+        mape = mape_sum / count
+
+        return rmse, mae, mape
+
+
+    RMSE_train, MAE_train, MAPE_train = calculate_metrics_in_batches(P_pred_train, targets_train)
+    print(f"RMSE_train:{RMSE_train}")
+    print(f"MAE_train:{MAE_train}")
+    print(f"MAPE_train:{MAPE_train}")
+
+    # Calculate metrics for validation set
     P_pred_val, P_t_pred_val = model(inputs=inputs_val)
-    RMSPE_val = torch.sqrt(torch.mean((P_pred_val - targets_val) ** 2, dim=1))
-    print(f"RMSPE_val:{RMSPE_val}")
+    RMSE_val, MAE_val, MAPE_val = calculate_metrics_in_batches(P_pred_val, targets_val)
+    print(f"RMSE_val:{RMSE_val}")
+    print(f"MAE_val:{MAE_val}")
+    print(f"MAPE_val:{MAPE_val}")
+
+    # Calculate metrics for test set
     P_pred_test, P_t_pred_test = model(inputs=inputs_test)
-    RMSPE_test = torch.sqrt(torch.mean((P_pred_test - targets_test) ** 2, dim=1))
-    print(f"RMSPE_test:{RMSPE_test}")
-    # metric_rounds['train'][round] = RMSPE_train.detach().cpu().numpy()
-    # metric_rounds['val'][round] = RMSPE_val.detach().cpu().numpy()
-    # metric_rounds['test'][round] = RMSPE_test.detach().cpu().numpy()
-    # metric_mean['train'] = np.mean(metric_rounds['train'])
-    # metric_mean['val'] = np.mean(metric_rounds['val'])
-    # metric_mean['test'] = np.mean(metric_rounds['test'])
-    # metric_std['train'] = np.std(metric_rounds['train'])
-    # metric_std['val'] = np.std(metric_rounds['val'])
-    # metric_std['test'] = np.std(metric_rounds['test'])
+    RMSE_test, MAE_test, MAPE_test = calculate_metrics_in_batches(P_pred_test, targets_test)
+    print(f"RMSE_test:{RMSE_test}")
+    print(f"MAE_test:{MAE_test}")
+    print(f"MAPE_test:{MAPE_test}")
+
+
+    def calculate_r2_in_batches(predictions, targets, batch_size=1024):
+        """分批计算R²以节省内存"""
+        # 确保输入是一维的
+        if predictions.dim() > 1:
+            predictions = predictions.squeeze()
+        if targets.dim() > 1:
+            targets = targets.squeeze()
+
+        total_samples = predictions.size(0)
+        sum_squared_error = 0.0
+
+        # 计算目标值的均值
+        target_mean_sum = 0.0
+        for i in range(0, total_samples, batch_size):
+            end_idx = min(i + batch_size, total_samples)
+            target_batch = targets[i:end_idx]
+            target_mean_sum += torch.sum(target_batch)
+
+        target_mean = target_mean_sum / total_samples
+
+        # 计算SSE和SST
+        sum_squared_error = 0.0
+        sum_squared_total = 0.0
+
+        for i in range(0, total_samples, batch_size):
+            end_idx = min(i + batch_size, total_samples)
+            pred_batch = predictions[i:end_idx]
+            target_batch = targets[i:end_idx]
+
+            # 累加误差平方和
+            sum_squared_error += torch.sum((target_batch - pred_batch) ** 2)
+
+            # 累加总平方和
+            sum_squared_total += torch.sum((target_batch - target_mean) ** 2)
+
+        # 避免分母接近零的情况
+        epsilon = 1e-10
+        if sum_squared_total < epsilon:
+            print(f"Warning: sum_squared_total is very small: {sum_squared_total}")
+            return torch.tensor(0.0)  # 返回0而不是可能的大负值
+
+        # 打印中间值进行诊断
+        print(f"SSE: {sum_squared_error.item()}, SST: {sum_squared_total.item()}")
+
+        # 计算R²
+        r2 = 1 - (sum_squared_error / sum_squared_total)
+
+        return r2
+
+
+    # 使用分批计算R²
+    # 替换原始的R²计算
+    R2_train = calculate_r2_in_batches(P_pred_train, targets_train)
+    print(f"R-squared (train): {R2_train.item():.4f}")
+
+    R2_val = calculate_r2_in_batches(P_pred_val, targets_val)
+    print(f"R-squared (val): {R2_val.item():.4f}")
+
+    R2_test = calculate_r2_in_batches(P_pred_test, targets_test)
+    print(f"R-squared (test): {R2_test.item():.4f}")
+
+    # Store metrics in dictionaries
+    metric_rounds['train'][round] = RMSE_train.item()
+    metric_rounds['val'][round] = RMSE_val.item()
+    metric_rounds['test'][round] = RMSE_test.item()
+
+    # 对于均值，我们在所有轮次结束后再计算
+    if round == num_rounds - 1:
+        metric_mean['train'] = np.mean(metric_rounds['train'])
+        metric_mean['val'] = np.mean(metric_rounds['val'])
+        metric_mean['test'] = np.mean(metric_rounds['test'])
+
+        metric_std['train'] = np.std(metric_rounds['train'])
+        metric_std['val'] = np.std(metric_rounds['val'])
+        metric_std['test'] = np.std(metric_rounds['test'])
+
+        print(f"\nAverage metrics over {num_rounds} rounds:")
+        print(f"Train RMSE: {metric_mean['train']:.4f} ± {metric_std['train']:.4f}")
+        print(f"Val RMSE: {metric_mean['val']:.4f} ± {metric_std['val']:.4f}")
+        print(f"Test RMSE: {metric_mean['test']:.4f} ± {metric_std['test']:.4f}")
+    
 model.eval()
 inputs_test = inputs_dict['test'].to(device)
 targets_test = targets_dict['test'].to(device)
