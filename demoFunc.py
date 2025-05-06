@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, confusion_matrix
 
 # 设置中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei']  # 用来正常显示中文标签
+
 plt.rcParams['axes.unicode_minus'] = False  # 用来正常显示负号
 
 # 设置 PyTorch 环境
@@ -28,9 +28,78 @@ class Sin(nn.Module):
         return torch.sin(input)
 
 
+# ResNet18时序故障分类器块
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv1d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(planes)
+        self.conv2 = nn.Conv1d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm1d(planes)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion*planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv1d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm1d(self.expansion*planes)
+            )
+
+    def forward(self, x):
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = torch.relu(out)
+        return out
+
+
+class ResNet18Classifier(nn.Module):
+    def __init__(self, in_channels, num_classes=1):
+        super(ResNet18Classifier, self).__init__()
+        self.in_planes = 64
+        
+        # 初始层
+        self.conv1 = nn.Conv1d(in_channels, 64, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm1d(64)
+        
+        # ResNet层
+        self.layer1 = self._make_layer(BasicBlock, 64, 2, stride=1)
+        self.layer2 = self._make_layer(BasicBlock, 128, 2, stride=2)
+        self.layer3 = self._make_layer(BasicBlock, 256, 2, stride=2)
+        self.layer4 = self._make_layer(BasicBlock, 512, 2, stride=2)
+        
+        # 分类头
+        self.avgpool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(512, num_classes)
+        
+        # 转换为double类型
+        self.to(torch.float64)
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1]*(num_blocks-1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        # x预期形状: [batch_size, channels, seq_len]
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.layer1(out)
+        out = self.layer2(out)
+        out = self.layer3(out)
+        out = self.layer4(out)
+        out = self.avgpool(out)
+        out = out.view(out.size(0), -1)
+        out = self.fc(out)
+        return out
+
+
 # 模型超参数
 BATCH_SIZE = 128
-NUM_EPOCH = 20
+NUM_EPOCH = 100
 NUM_LAYERS = 5
 NUM_NEURONS = 64
 NUM_ROUNDS = 2
@@ -391,6 +460,27 @@ class My_loss(nn.Module):
         self.loss_physics = torch.tensor(0.0, requires_grad=True)
         self.loss_cls = torch.tensor(0.0, requires_grad=True)
         self.cls_criterion = nn.BCEWithLogitsLoss()
+        
+        # 添加正样本权重计算以处理数据不平衡问题
+        self.pos_weight = None
+        
+    def set_pos_weight(self, targets_fault):
+        """设置正样本权重，用于处理类别不平衡问题"""
+        if targets_fault is not None and len(targets_fault) > 0:
+            # 计算正负样本比例
+            pos_count = torch.sum(targets_fault)
+            neg_count = len(targets_fault) - pos_count
+            
+            # 如果任一类别数量为0，设置默认权重
+            if pos_count == 0 or neg_count == 0:
+                self.pos_weight = torch.tensor([1.0], device=targets_fault.device)
+            else:
+                # 设置权重为负样本数/正样本数
+                weight = neg_count / pos_count
+                self.pos_weight = torch.tensor([weight], device=targets_fault.device)
+                print(f"分类权重更新: 正样本权重={weight.item():.4f} (正样本:{pos_count}个, 负样本:{neg_count}个)")
+        else:
+            self.pos_weight = torch.tensor([1.0])
 
     def mixture_density_derivative(self, p, bulk_modulus_model, air_dissolution_model,
                                    rho_L_atm, beta_L_atm, beta_gain, air_fraction,
@@ -596,8 +686,14 @@ class My_loss(nn.Module):
                 batch_loss_physics = batch_loss_physics + torch.abs(physics_loss)
                 batch_loss_M = batch_loss_M + mae_loss
 
+        # 更新类别权重
+        self.set_pos_weight(targets_fault)
+        
+        # 使用带有类别权重的BCEWithLogitsLoss
+        weighted_criterion = nn.BCEWithLogitsLoss(pos_weight=self.pos_weight)
+        
         # 计算分类损失
-        cls_loss = self.cls_criterion(fault_logit.squeeze(-1), targets_fault.float())
+        cls_loss = weighted_criterion(fault_logit.squeeze(-1), targets_fault.float())
 
         # 计算平均损失
         total_elements = batch_size * seq_len
@@ -612,7 +708,7 @@ class My_loss(nn.Module):
 
 
 class MultiTaskPINN(nn.Module):
-    def __init__(self, seq_len, inputs_dim, outputs_dim, layers, scaler_inputs, scaler_targets, activation='Tanh'):
+    def __init__(self, seq_len, inputs_dim, outputs_dim, layers, scaler_inputs, scaler_targets, activation='Sin'):
         super().__init__()
         self.seq_len = seq_len
         self.inputs_dim = inputs_dim
@@ -623,16 +719,9 @@ class MultiTaskPINN(nn.Module):
         # 预测压力的PINN网络
         self.pinn = Neural_Net(seq_len, inputs_dim, outputs_dim, layers, activation)
 
-        # 故障分类分支 - 将压力预测与原始特征(pIn, mdot_A, iMotor)合并处理后输出单个故障概率
-        # 输入特征: 压力预测(seq_len), pIn(seq_len), mdot_A(seq_len), iMotor(seq_len)
-        self.fc_fault = nn.Sequential(
-            nn.Linear(seq_len * (outputs_dim + 3), 64).double(),  # 增加特征数量: 压力 + pIn + mdot_A + iMotor
-            nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 32).double(),
-            nn.ReLU(),
-            nn.Linear(32, 1).double()
-        )
+        # 使用ResNet18进行故障分类
+        # 输入特征: [batch, 4, seq_len] - 4个通道: 压力预测, pIn, mdot_A, iMotor
+        self.classifier = ResNet18Classifier(in_channels=4, num_classes=1)
 
     def forward(self, x):
         """
@@ -691,8 +780,6 @@ class MultiTaskPINN(nn.Module):
                                           mean=mean_inputs[0:1],
                                           std=std_inputs[0:1])
         t_norm.requires_grad_(True)
-        # 构建标准化后的输入张量 - 确保特征顺序正确
-        # x_norm = torch.cat([t_norm, s_norm], dim=2)
 
         # 通过PINN网络获取压力预测
         P_norm = self.pinn(torch.cat([t_norm, s_norm], dim=2))
@@ -733,24 +820,20 @@ class MultiTaskPINN(nn.Module):
         # 还原为 dP/dt_raw
         P_t = P_t_norm / std_inputs[0]  # std_inputs[0] 是 time 的标准差
         
-        # 故障分类 - 使用整个序列的压力预测和原始特征
-        P_flat = P.reshape(batch_size, -1)        # [batch, seq_len*1]
-        pIn_flat = pIn.reshape(batch_size, -1)    # [batch, seq_len*1]
-        mdot_A_flat = mdot_A.reshape(batch_size, -1)  # [batch, seq_len*1]
-        iMotor_flat = iMotor.reshape(batch_size, -1)  # [batch, seq_len*1]
-        # 获取标准化后的特征用于故障分类
-        # 确保使用标准化后的参数进行分类
-        P_norm_flat = P_norm.reshape(batch_size, -1)  # [batch, seq_len*1]
+        # 故障分类 - 使用ResNet18
+        # 准备输入: [batch, 4, seq_len]
+        # 将标准化后的P_norm与输入特征组合
+        # 组织输入特征为: [batch, channels, seq_len] 格式, 为了使用1D卷积
+        P_norm_t = P_norm.transpose(1, 2)       # [batch, 1, seq_len]
+        pIn_norm_t = s_norm[:, :, 0:1].transpose(1, 2)  # [batch, 1, seq_len]
+        mdot_A_norm_t = s_norm[:, :, 1:2].transpose(1, 2)  # [batch, 1, seq_len]
+        iMotor_norm_t = s_norm[:, :, 2:3].transpose(1, 2)  # [batch, 1, seq_len]
         
-        # 获取标准化后的输入特征
-        # 假设s_norm包含了标准化后的pIn, mdot_A, iMotor等特征
-        # 从s_norm中提取各个特征
-        pIn_norm = s_norm[:, :, 0].reshape(batch_size, -1)  # [batch, seq_len*1]
-        mdot_A_norm = s_norm[:, :, 1].reshape(batch_size, -1)  # [batch, seq_len*1]
-        iMotor_norm = s_norm[:, :, 2].reshape(batch_size, -1)  # [batch, seq_len*1]
-        # 合并所有标准化后的特征
-        feat_cls = torch.cat([P_norm_flat, pIn_norm, mdot_A_norm, iMotor_norm], dim=1)  # [batch, seq_len*4]
-        fault_logit = self.fc_fault(feat_cls)
+        # 合并特征
+        features = torch.cat([P_norm_t, pIn_norm_t, mdot_A_norm_t, iMotor_norm_t], dim=1)  # [batch, 4, seq_len]
+        
+        # 使用ResNet18进行分类
+        fault_logit = self.classifier(features)
 
         return P, P_t, fault_logit
 
@@ -832,7 +915,7 @@ def main():
 
     # 1. 数据加载和预处理
     print("1. 加载和预处理数据...")
-    data = pd.read_csv('combined_all_f1.csv')
+    data = pd.read_csv('combined_all_t.csv')
 
     # 提取特征和标签
     X = data[['time', 'pIn', 'mdot_A', 'iMotor']].values  # 输入特征
@@ -916,7 +999,7 @@ def main():
     # 确保数据集不为空再创建DataLoader
     print(f"创建DataLoader，batch_size={BATCH_SIZE}...")
     if len(train_set) > 0 and len(val_set) > 0 and len(test_set) > 0:
-        train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=False, drop_last=True)
+        train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, drop_last=True)  # 启用随机打乱以增强泛化性
         val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, drop_last=True)
         test_loader = DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False, drop_last=True)
         print(f"DataLoader创建成功！")
@@ -950,13 +1033,14 @@ def main():
             outputs_dim=outputs_dim,
             layers=layers,
             scaler_inputs=(X_mean, X_std),
-            scaler_targets=(y_p_mean, y_p_std)
+            scaler_targets=(y_p_mean, y_p_std),
+            activation='Sin'  # 使用Sin激活函数
         ).to(device)
 
         # 初始化损失函数和优化器
-        criterion = My_loss(physics_weight=0.5, cls_weight=0.5)
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
-        scheduler = optim.lr_scheduler.StepLR(optimizer, 100, gamma=0.1)
+        criterion = My_loss(physics_weight=0.5, cls_weight=0.8)  # 增大分类损失权重
+        optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)  # 添加权重衰减以减少过拟合
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, verbose=True)  # 使用更灵活的学习率调整策略
 
         # 训练模型
         train_losses = []
@@ -973,7 +1057,7 @@ def main():
         # 初始化早停变量
         best_val_loss = float('inf')
         no_improvement_count = 0
-        patience = 10  # 早停耐心值，连续10轮无改善就停止
+        patience = 30  # 早停耐心值，连续10轮无改善就停止
 
         for epoch in range(NUM_EPOCH):
             # 训练阶段
@@ -1034,6 +1118,10 @@ def main():
                     # 反向传播和优化
                     optimizer.zero_grad()
                     loss[0].backward()  # 总损失
+                    
+                    # 梯度裁剪，防止梯度爆炸
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
                     optimizer.step()
 
                     # 累加损失
@@ -1154,6 +1242,9 @@ def main():
                 avg_val_loss = epoch_val_loss / num_val_batches
                 val_losses.append(avg_val_loss)
 
+                # 更新学习率调度器
+                scheduler.step(avg_val_loss)
+
                 if best_val_loss > avg_val_loss:
                     best_val_loss = avg_val_loss
                     torch.save(model.state_dict(),
@@ -1166,6 +1257,11 @@ def main():
                 avg_val_loss = float('inf')
                 val_losses.append(avg_val_loss)
                 no_improvement_count += 1
+                
+            # 早停检查
+            if no_improvement_count >= patience:
+                print(f"\n验证损失已连续{patience}轮未改善，提前停止训练！")
+                break
 
             # 测试阶段
             model.eval()
@@ -1294,8 +1390,7 @@ def main():
             print(f"  Val Loss: {avg_val_loss:.6f}")
             print(f"  Test Loss: {avg_test_loss:.6f}")
 
-            # 更新学习率
-            scheduler.step()
+            
 
         all_losses['train'].append(train_losses)
         all_losses['val'].append(val_losses)
@@ -1459,7 +1554,7 @@ def main():
                     'classification': cls_metrics
                 }
             }
-            torch.save(results, 'multitask_results.pth')
+            torch.save(results, 'multitask_results_resnet.pth')
 
             # 创建和保存损失曲线
             plt.figure(figsize=(10, 6))
@@ -1470,7 +1565,7 @@ def main():
             plt.ylabel('Loss')
             plt.title('Loss Curves')
             plt.legend()
-            plt.savefig('multitask_loss_curve.png')
+            plt.savefig('multitask_loss_curve_resnet.png')
             plt.close()
 
             print('训练完成。结果已保存。')
@@ -1524,9 +1619,18 @@ def main():
 
     # 计算所有轮次的平均损失
     if all_losses['train'] and all(isinstance(losses, list) and losses for losses in all_losses['train']):
-        avg_train_losses = np.mean([losses for losses in all_losses['train'] if losses], axis=0)
-        avg_val_losses = np.mean([losses for losses in all_losses['val'] if losses], axis=0)
-        avg_test_losses = np.mean([losses for losses in all_losses['test'] if losses], axis=0)
+        # 取所有轮次中最短的loss曲线长度
+        min_len = min(len(losses) for losses in all_losses['train'] if len(losses) > 0)
+
+        # 截断所有loss曲线到相同长度
+        train_losses_aligned = np.array([losses[:min_len] for losses in all_losses['train'] if len(losses) >= min_len])
+        val_losses_aligned = np.array([losses[:min_len] for losses in all_losses['val'] if len(losses) >= min_len])
+        test_losses_aligned = np.array([losses[:min_len] for losses in all_losses['test'] if len(losses) >= min_len])
+
+        # 计算均值
+        avg_train_losses = np.mean(train_losses_aligned, axis=0)
+        avg_val_losses = np.mean(val_losses_aligned, axis=0)
+        avg_test_losses = np.mean(test_losses_aligned, axis=0)
         # Plot training and validation losses
         plt.plot(range(1, len(avg_train_losses) + 1), avg_train_losses, label='Training Loss')
         plt.plot(range(1, len(avg_val_losses) + 1), avg_val_losses, label='Validation Loss')
@@ -1539,7 +1643,7 @@ def main():
         plt.grid(True)
 
         # Save the image
-        plt.savefig('multitask_loss_curve.png', dpi=300, bbox_inches='tight')
+        plt.savefig('multitask_loss_curve_resnet.png', dpi=300, bbox_inches='tight')
         print("\nLoss function trend chart has been saved to 'multitask_loss_curve.png'")
 
     # 5. 保存最终模型和结果
@@ -1615,7 +1719,7 @@ def main():
             }
         }
 
-        torch.save(results, 'multitask_results.pth')
+        torch.save(results, 'multitask_results_resnet.pth')
         print("结果已保存到 'multitask_results.pth'")
     else:
         print("警告: 无法保存最终结果，评估数据不完整")
@@ -1633,17 +1737,21 @@ def main():
     return model
 
 
-def calculate_classification_metrics(y_true, y_pred, y_scores=None):
+def calculate_classification_metrics(y_true, y_pred, y_scores=None, batch_size=10000):
     """计算分类指标: 准确率, 精确率, 召回率, F1分数, ROC曲线下面积(AUC)
 
     Args:
         y_true: 真实标签
         y_pred: 二分类预测结果
         y_scores: 预测概率分数，用于ROC/AUC计算
+        batch_size: 批处理大小，用于处理大数据集
 
     Returns:
         含有各项分类指标的字典
     """
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+    import numpy as np
+
     # 确保输入是numpy数组
     if isinstance(y_true, torch.Tensor):
         y_true = y_true.cpu().numpy()
@@ -1657,17 +1765,39 @@ def calculate_classification_metrics(y_true, y_pred, y_scores=None):
     y_pred = y_pred.flatten()
     if y_scores is not None:
         y_scores = y_scores.flatten()
-
-    # 计算混淆矩阵
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
-
+    
+    # 计算基本指标（无需构建完整混淆矩阵）
+    # 手动计算混淆矩阵值
+    total_samples = len(y_true)
+    
+    # 初始化计数器
+    tn, fp, fn, tp = 0, 0, 0, 0
+    
+    # 分批处理数据以节省内存
+    for i in range(0, total_samples, batch_size):
+        end_idx = min(i + batch_size, total_samples)
+        y_true_batch = y_true[i:end_idx]
+        y_pred_batch = y_pred[i:end_idx]
+        
+        # 计算每个批次的统计数据
+        tp += np.sum((y_true_batch == 1) & (y_pred_batch == 1))
+        fp += np.sum((y_true_batch == 0) & (y_pred_batch == 1))
+        fn += np.sum((y_true_batch == 1) & (y_pred_batch == 0))
+        tn += np.sum((y_true_batch == 0) & (y_pred_batch == 0))
+    
     # 计算指标
+    accuracy = (tp + tn) / total_samples if total_samples > 0 else 0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+    
     metrics = {
-        'accuracy': accuracy_score(y_true, y_pred),
-        'precision': precision_score(y_true, y_pred, zero_division=0),
-        'recall': recall_score(y_true, y_pred, zero_division=0),
-        'f1': f1_score(y_true, y_pred, zero_division=0),
-        'specificity': tn / (tn + fp) if (tn + fp) > 0 else 0,
+        'accuracy': float(accuracy),
+        'precision': float(precision),
+        'recall': float(recall),
+        'f1': float(f1),
+        'specificity': float(specificity),
         'confusion_matrix': {
             'tn': int(tn),
             'fp': int(fp),
@@ -1679,7 +1809,15 @@ def calculate_classification_metrics(y_true, y_pred, y_scores=None):
     # 如果提供了概率分数，计算ROC/AUC
     if y_scores is not None and len(np.unique(y_true)) > 1:
         try:
-            metrics['auc'] = roc_auc_score(y_true, y_scores)
+            # 对于大数据集，采样计算AUC
+            if total_samples > batch_size:
+                # 随机选择一部分样本进行AUC计算
+                np.random.seed(42)  # 设置随机种子以确保可重复性
+                indices = np.random.choice(total_samples, min(batch_size, total_samples), replace=False)
+                metrics['auc'] = roc_auc_score(y_true[indices], y_scores[indices])
+                print(f"注意: AUC基于{min(batch_size, total_samples)}个随机样本计算")
+            else:
+                metrics['auc'] = roc_auc_score(y_true, y_scores)
         except Exception as e:
             metrics['auc'] = 0
             print(f"计算AUC失败: {e}")
